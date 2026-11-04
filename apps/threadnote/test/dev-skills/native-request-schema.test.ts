@@ -111,6 +111,7 @@ describe('native request schema discovery', () => {
         phaseId: expect.any(String),
         snapshotId: expect.stringContaining('fresh immutable'),
         rebase: expect.stringContaining('Requires acceptedHead, reason and explicit userAuthority'),
+        baseRequalification: expect.stringContaining('Requires reason and explicit userAuthority.'),
       },
     ],
     [
@@ -133,13 +134,18 @@ describe('native request schema discovery', () => {
     expect(JSON.parse(response.schemaPage.text).schema.required).not.toContain('expectedRevision');
   });
 
-  it('discovers both mandatory review lanes with additional specialists optional', () => {
+  it('discovers mandatory review lanes and the risk-based specialist requirement', () => {
     const response = nativeRequestSchema({...base, topic: 'cycle-review'});
     expect(response).toMatchObject({
       semanticPrerequisites: {
         requiredSelectedLanes: ['correctness', 'simplicity'],
         requiredCompletedLanes: ['correctness', 'simplicity'],
-        specialistLanes: expect.stringContaining('Additional specialist lanes are optional'),
+        specialistLanes: expect.stringContaining('run every applicable lane'),
+      },
+    });
+    expect(response).toMatchObject({
+      semanticPrerequisites: {
+        specialistLanes: expect.stringContaining('cannot determine which specialists apply'),
       },
     });
   });

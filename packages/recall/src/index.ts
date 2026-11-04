@@ -10,9 +10,9 @@ import {
 } from './index/result.js';
 import * as SqliteClient from '@effect/sql-sqlite-bun/SqliteClient';
 import * as SqlClient from 'effect/sql/SqlClient';
-import {useRecallDatabase} from './index/database.js';
+import {useRecallDatabase as useSessionRecallDatabase} from './index/database.js';
 export {withRecallDatabaseSession} from './index/database.js';
-import {withExclusiveFileLock} from '@threadnote/platform/file/lock';
+import {FileLockTimeout, fileLockBusyMessage, withExclusiveFileLock} from '@threadnote/platform/file/lock';
 import {resourceAccountMutationLockPath} from '@threadnote/store/resource/lock';
 import {
   isExternalResourceUri,
@@ -61,6 +61,13 @@ import {
 } from './memory/links.js';
 import * as RecallIndexIdentity from './index/identity.js';
 import {
+  failFastIdentityPreparation,
+  normalizeRecallIdentityPreparation,
+  readRecallIdentityAdmissionCut,
+  RecallIdentityAdmissionBusy,
+  withPreparedRecallIdentityAdmission,
+} from './index/admission.js';
+import {
   recallIndexCanonicalMutationContinuityAllowsIncrementalRefresh,
   recallIndexForegroundRefreshRequired,
 } from './index/freshness.js';
@@ -69,6 +76,8 @@ import {
   readRecallStaleMarker as readStaleMarker,
   type RecallStaleMarker,
   writeRecallStaleGeneration as writeStaleGeneration,
+  withRecallPublicationLock,
+  recallPublicationFenceHeld,
 } from './index/stale_marker.js';
 import {
   combineRecallSqlPredicates,
@@ -454,12 +463,16 @@ const recoverRecallIndex = Effect.fn('recall.recoverIndex')(function* (
         true,
         true,
       ).pipe(
-        Effect.catchCause(secondCause =>
-          Effect.fail(
-            RecallIndexOperationError.make({
-              message: `Lexical recall index recovery failed: ${Cause.pretty(firstCause)}; replacement failed: ${Cause.pretty(secondCause)}`,
-            }),
-          ),
+        normalizeRecallIdentityPreparation,
+        Effect.catchCauseIf(
+          secondCause =>
+            !Cause.hasInterrupts(secondCause) && !Schema.is(RecallIdentityAdmissionBusy)(Cause.squash(secondCause)),
+          secondCause =>
+            Effect.fail(
+              RecallIndexOperationError.make({
+                message: `Lexical recall index recovery failed: ${Cause.pretty(firstCause)}; replacement failed: ${Cause.pretty(secondCause)}`,
+              }),
+            ),
         ),
         Effect.ensuring(removeRecallDatabaseAuxiliaryFiles(fs, replacementPath).pipe(Effect.ignore)),
       );
@@ -509,9 +522,37 @@ export const loadRecallMemoryIdentities = Effect.fn('recall.loadMemoryIdentities
     includeInactive: false,
     memoryIds: options.memoryIds,
     validateNow: options.validateNow,
-  });
+  }).pipe(normalizeRecallIdentityPreparation);
   return data.candidates;
 });
+
+export {RecallIdentityAdmissionBusy, withRecallIdentityPreparation} from './index/admission.js';
+
+/** Prepare outside memory locks; consume the check once under the canonical account mutation fence. */
+export function withRecallIdentityAdmission<A, E, R, E2, R2>(
+  config: RecallIndexConfig,
+  prepare: Effect.Effect<void, E, R>,
+  use: (check: Effect.Effect<void, unknown, FileSystem.FileSystem | Path.Path>) => Effect.Effect<A, E2, R2>,
+) {
+  const location = {...config};
+  return Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return yield* withPreparedRecallIdentityAdmission(
+      loadRecallMemoryIdentities(location, {allowedUriScopes: [], memoryIds: []}).pipe(Effect.asVoid),
+      readRecallIdentityAdmissionCut({
+        account: location.account,
+        home: location.agentContextHome,
+        databasePath: resolveActiveRecallDatabasePath(fs, path, location.agentContextHome, false),
+        pointerPath: recallIndexPointerPath(path, location.agentContextHome, false),
+        fixedDatabasePath: recallIndexDatabasePath(path, location.agentContextHome, false),
+        schemaVersion: RECALL_INDEX_DATABASE_VERSION,
+      }),
+      prepare,
+      check => withRecallIndexLock(fs, path, location.agentContextHome, false, () => use(check), location.account),
+    );
+  });
+}
 
 export const loadRecallExactMatches = Effect.fn('recall.loadExactMatches')(function* (
   config: RecallIndexConfig,
@@ -1086,6 +1127,27 @@ const writeActiveRecallDatabasePointer = Effect.fn('recall.writeActiveDatabasePo
     .pipe(Effect.ensuring(fs.remove(temporaryPath, {force: true}).pipe(Effect.ignore)));
 });
 
+function useRecallDatabase<A, E, R>(
+  databasePath: string,
+  effect: Effect.Effect<A, E, R | SqlClient.SqlClient>,
+  reusable = true,
+) {
+  return Effect.gen(function* () {
+    const failFast = yield* failFastIdentityPreparation;
+    // Fail-fast admission must open independently with zero SQLite busy wait;
+    // ordinary sequential requests retain the existing identity-checked session.
+    if (!failFast) return yield* useSessionRecallDatabase(databasePath, effect, reusable);
+    return yield* Effect.scoped(
+      Layer.build(
+        SqliteClient.layer({filename: databasePath, ...(failFast ? {busyTimeout: 0} : {})}).pipe(Layer.orDie),
+      ).pipe(
+        Effect.withSpan('recall.acquireDatabase'),
+        Effect.flatMap(context => effect.pipe(Effect.provide(context), Effect.withSpan('recall.databaseBody'))),
+      ),
+    );
+  });
+}
+
 function useRecallDatabaseReadOnly<A, E, R>(
   databasePath: string,
   effect: Effect.Effect<A, E, R | SqlClient.SqlClient>,
@@ -1105,7 +1167,7 @@ function useRecallDatabaseReadOnly<A, E, R>(
 
 const initializeRecallDatabase = Effect.fn('recall.initializeDatabase')(function* (sql: SqlClient.SqlClient) {
   yield* sql.unsafe('PRAGMA foreign_keys = ON');
-  yield* sql.unsafe('PRAGMA busy_timeout = 5000');
+  yield* sql.unsafe((yield* failFastIdentityPreparation) ? 'PRAGMA busy_timeout = 0' : 'PRAGMA busy_timeout = 5000');
   yield* sql.unsafe(`
     CREATE TABLE IF NOT EXISTS metadata (
       key TEXT PRIMARY KEY NOT NULL,
@@ -1761,18 +1823,43 @@ function withRecallIndexLock<A, E, R>(
   home: string,
   includeInactive: boolean,
   effect: () => Effect.Effect<A, E, R>,
+  admissionAccount?: string,
 ) {
-  return withExclusiveFileLock(
-    fs,
-    path.join(home, 'locks', 'indexes', 'lexical', `${recallIndexDatabaseFilename(includeInactive)}.lock`),
-    {
-      heartbeatIntervalMilliseconds: 10_000,
-      retryIntervalMilliseconds: 100,
-      staleAfterMilliseconds: 60_000,
-      waitTimeoutMilliseconds: 120_000,
-    },
-    Effect.suspend(effect),
-  );
+  return Effect.gen(function* () {
+    const lockPath = recallIndexLockPath(path, home, includeInactive);
+    const reentrant = yield* recallPublicationFenceHeld(lockPath);
+    const locked = withRecallPublicationLock(
+      fs,
+      lockPath,
+      {
+        category: 'recall-index',
+        heartbeatIntervalMilliseconds: 10_000,
+        retryIntervalMilliseconds: 100,
+        staleAfterMilliseconds: 60_000,
+        waitTimeoutMilliseconds:
+          admissionAccount !== undefined || reentrant || (yield* failFastIdentityPreparation) ? 0 : 120_000,
+      },
+      Effect.result(Effect.suspend(effect)),
+      admissionAccount,
+    );
+    return yield* (
+      admissionAccount !== undefined
+        ? locked.pipe(
+            Effect.catchIf(Schema.is(FileLockTimeout), error =>
+              Effect.fail(
+                RecallIdentityAdmissionBusy.make({
+                  message: fileLockBusyMessage(error),
+                }),
+              ),
+            ),
+          )
+        : locked
+    ).pipe(Effect.flatMap(Effect.fromResult));
+  });
+}
+
+function recallIndexLockPath(path: Path.Path, home: string, includeInactive: boolean) {
+  return path.join(home, 'locks', 'indexes', 'lexical', `${recallIndexDatabaseFilename(includeInactive)}.lock`);
 }
 
 function withCanonicalResourceMutationLock<A, E, R>(
@@ -1782,17 +1869,20 @@ function withCanonicalResourceMutationLock<A, E, R>(
   account: string,
   effect: Effect.Effect<A, E, R>,
 ) {
-  return withExclusiveFileLock(
-    fs,
-    resourceAccountMutationLockPath(path, home, account),
-    {
-      heartbeatIntervalMilliseconds: 10_000,
-      retryIntervalMilliseconds: 25,
-      staleAfterMilliseconds: 30_000,
-      waitTimeoutMilliseconds: 30_000,
-    },
-    effect,
-  );
+  return Effect.gen(function* () {
+    return yield* withExclusiveFileLock(
+      fs,
+      resourceAccountMutationLockPath(path, home, account),
+      {
+        category: 'canonical-account',
+        heartbeatIntervalMilliseconds: 10_000,
+        retryIntervalMilliseconds: 25,
+        staleAfterMilliseconds: 30_000,
+        waitTimeoutMilliseconds: (yield* failFastIdentityPreparation) ? 0 : 30_000,
+      },
+      effect,
+    );
+  });
 }
 
 function removeRecallDatabaseAuxiliaryFiles(fs: FileSystem.FileSystem, databasePath: string) {
