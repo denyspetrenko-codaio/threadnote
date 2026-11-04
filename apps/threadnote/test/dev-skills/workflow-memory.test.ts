@@ -143,20 +143,28 @@ describe('private workflow artifact protocol', () => {
       const release = yield* Deferred.make<void>();
       let observations = 0;
       const events: string[] = [];
+      const methods: ('status' | 'session')[] = [];
+      const observe = (method: 'status' | 'session') =>
+        Effect.gen(function* () {
+          const names = yield* f.fs
+            .readDirectory(f.path.join(f.home, 'threadnote', 'memory-locks'))
+            .pipe(Effect.orElseSucceed(() => []));
+          methods.push(method);
+          events.push(`graph:${names.length}`);
+          if (++observations === 2) {
+            yield* Deferred.succeed(paused, undefined);
+            yield* Deferred.await(release);
+          }
+        });
+      const session = query.withStatusSession;
+      const observedSession: typeof session = session
+        ? (home, cwd, expected, options, use) =>
+            session(home, cwd, expected, options, status => observe('session').pipe(Effect.flatMap(() => use(status))))
+        : undefined;
       const guarded = CodeGraphQueryService.of({
         ...query,
-        status: (...args) =>
-          Effect.gen(function* () {
-            const names = yield* f.fs
-              .readDirectory(f.path.join(f.home, 'threadnote', 'memory-locks'))
-              .pipe(Effect.orElseSucceed(() => []));
-            events.push(`graph:${names.length}`);
-            if (++observations === 2) {
-              yield* Deferred.succeed(paused, undefined);
-              yield* Deferred.await(release);
-            }
-            return yield* query.status(...args);
-          }),
+        status: (...args) => observe('status').pipe(Effect.flatMap(() => query.status(...args))),
+        ...(observedSession ? {withStatusSession: observedSession} : {}),
       });
       const first = yield* f
         .call({...f.write, codeRefs: ['src/value.ts'], citationPolicy: 'defer'})
@@ -168,6 +176,7 @@ describe('private workflow artifact protocol', () => {
           .pipe(Effect.timeoutOption('3 seconds'));
         expect(other).toMatchObject({_tag: 'Some', value: {status: 'ok'}});
         expect(events).toEqual(['graph:0', 'graph:0']);
+        expect(methods).toEqual(session ? ['session', 'status'] : ['status', 'status']);
       }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
       expect(yield* Fiber.join(first)).toMatchObject({status: 'ok'});
     }).pipe(TestClock.withLive, provideTestLayer(ApplicationLayer)),
