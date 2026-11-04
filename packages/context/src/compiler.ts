@@ -5,6 +5,7 @@ export {
   selectSemanticContextSymbol,
   filterSemanticContextMemory,
   projectSemanticContextKnowledge,
+  compactSemanticContextKnowledge,
 } from './semantic_evidence.js';
 import {DateTime, Effect} from 'effect';
 import {succeedUndefined} from '@threadnote/platform/optional';
