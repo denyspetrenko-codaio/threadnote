@@ -1,5 +1,11 @@
 import {Array as EffectArray, Option as EffectOption} from 'effect';
-export {retrieveSemanticContextSourceEvidence, projectSemanticContextKnowledge} from './semantic_evidence.js';
+export {
+  retrieveSemanticContextSourceEvidence,
+  retrieveSemanticContextSymbol,
+  selectSemanticContextSymbol,
+  filterSemanticContextMemory,
+  projectSemanticContextKnowledge,
+} from './semantic_evidence.js';
 import {DateTime, Effect} from 'effect';
 import {succeedUndefined} from '@threadnote/platform/optional';
 import type {ContextBriefGraphReadBudget} from './graph/evidence.js';
@@ -40,6 +46,8 @@ export interface ContextBriefCompilerDependencies<
   readonly procedureEvidence?: (
     plan: ContextBriefPlanV1,
   ) => Effect.Effect<VerifiedProcedureSelection, unknown, MemoryR>;
+  /** Internal callers may require source/target binding before any linked-memory read. */
+  readonly codeLinkedMemoryAfterGraph?: boolean;
   readonly codeLinkedMemoryEvidence?: (
     plan: ContextBriefPlanV1['codeAnchors'],
   ) => Effect.Effect<ContextBriefMemoryRetrievalV1, unknown, MemoryR>;
@@ -78,12 +86,12 @@ export const compileContextBriefWith = Effect.fn('contextBrief.compileWith')(fun
       ? succeedUndefined
       : dependencies.codeLinkedMemoryEvidence === undefined
         ? Effect.succeed(unavailableContextBriefCodeLinkedMemoryEvidence(plan.codeAnchors.codeRefs.length))
-        : dependencies.codeLinkedMemoryEvidence(plan.codeAnchors);
+        : Effect.suspend(() => dependencies.codeLinkedMemoryEvidence!(plan.codeAnchors));
   const [eagerGraph, lexicalMemory, linkedMemory, procedureEvidence] = yield* Effect.all(
     [
       plan.mode === 'resume' ? succeedUndefined : readGraph(plan.graph),
       dependencies.memoryEvidence(plan.memory),
-      codeLinkedMemory,
+      dependencies.codeLinkedMemoryAfterGraph ? succeedUndefined : codeLinkedMemory,
       dependencies.procedureEvidence?.(plan) ?? Effect.succeed({gaps: [], procedures: []}),
     ],
     {concurrency: 4},
@@ -93,7 +101,7 @@ export const compileContextBriefWith = Effect.fn('contextBrief.compileWith')(fun
     (yield* readGraph(withResumeMemoryGraphAnchors(plan.graph, lexicalMemory, plan.codeAnchors.candidateLimit)));
   const memory = mergeContextBriefMemoryEvidence(
     lexicalMemory,
-    linkedMemory,
+    dependencies.codeLinkedMemoryAfterGraph ? yield* codeLinkedMemory : linkedMemory,
     plan.memory.candidateLimit,
     plan.codeAnchors.candidateLimit,
   );
