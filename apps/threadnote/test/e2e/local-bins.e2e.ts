@@ -29,6 +29,7 @@ import {BUILTIN_MODEL_MANIFESTS, CORE_EMBEDDING_MODEL_ID} from '@threadnote/infe
 import {recallIndexDatabaseFilename} from '@threadnote/recall/index';
 import {vectorIndexDatabaseFilename} from '@threadnote/recall/vector-index';
 import {reportLocalBinsCleanupFailure, type LocalBinsCleanupFacts} from '../helpers/local-bins-cleanup-diagnostics.js';
+import {observeStdioClientTransportClose} from '../helpers/stdio-client-transport-close.js';
 import * as EffectRecord from 'effect/Record';
 import * as EffectString from 'effect/String';
 import * as Effect from 'effect';
@@ -141,6 +142,7 @@ let installedModelModifiedAt: number;
 let initialVectorRevision: string;
 let installOutput: string;
 let installedFiles: string[];
+let stdioTransportCloseEvent: LocalBinsCleanupFacts['stdioTransportCloseEvent'] = 'not-attempted';
 
 function installedLauncher(
   mode: 'cli' | 'mcp' = 'cli',
@@ -251,7 +253,14 @@ afterAll(async () => {
   } catch (cause) {
     reportLocalBinsCleanupFailure(
       cause,
-      {endpointRead, coordinatorPid, coordinatorPidWasRunning, terminationOutcome, coordinatorExitWaitCompleted},
+      {
+        endpointRead,
+        coordinatorPid,
+        coordinatorPidWasRunning,
+        stdioTransportCloseEvent,
+        terminationOutcome,
+        coordinatorExitWaitCompleted,
+      },
       line => {
         process.stderr.write(line);
       },
@@ -1348,7 +1357,7 @@ describe('built self-contained distribution', () => {
     await expect(runCli(['models', 'runtime'])).resolves.toMatch(/node-llama-cpp:\s+prebuilt/i);
   });
 
-  it('serves native core and full MCP toolsets over stdio', async () => {
+  it('serves native core and full MCP toolsets over stdio', async ({signal}) => {
     const vault = join(home, 'MCP Obsidian Vault');
     const projectionId = 'mcp-selected-memory';
     const sourceId = 'mcp-recall-source';
@@ -1377,7 +1386,11 @@ describe('built self-contained distribution', () => {
       },
       stderr: 'pipe',
     });
+    const transportClose = observeStdioClientTransportClose(transport);
+    stdioTransportCloseEvent = 'not-observed';
     const client = new Client({name: 'threadnote-e2e', version: '4.0.0'});
+    let operationFailed = false;
+    let operationFailure: unknown;
     try {
       await client.connect(transport);
       const names = EffectArray.map((await client.listTools()).tools, tool => tool.name);
@@ -1537,11 +1550,39 @@ describe('built self-contained distribution', () => {
           Effect.pipe(name, EffectString.startsWith('native-e2e--')),
         ),
       ).toBe(true);
-    } finally {
+    } catch (cause) {
+      operationFailed = true;
+      operationFailure = cause;
+    }
+
+    let cleanupFailed = false;
+    let cleanupFailure: unknown;
+    try {
       await client.close();
+    } catch (cause) {
+      cleanupFailed = true;
+      cleanupFailure = cause;
+    }
+    if (!cleanupFailed) {
+      try {
+        await transportClose.waitForCloseIfStarted(signal);
+        if (transportClose.closeObserved) stdioTransportCloseEvent = 'observed';
+      } catch (cause) {
+        cleanupFailed = true;
+        cleanupFailure = cause;
+      }
+    }
+    try {
       await runCli(['source', 'remove', sourceId, '--apply']);
       await runCli(['projection', 'remove', projectionId, '--apply']);
+    } catch (cause) {
+      if (!cleanupFailed) {
+        cleanupFailed = true;
+        cleanupFailure = cause;
+      }
     }
+    if (operationFailed) throw operationFailure;
+    if (cleanupFailed) throw cleanupFailure;
   });
 
   it('publishes a durable memory through a separate Git worktree into the remote', async () => {
